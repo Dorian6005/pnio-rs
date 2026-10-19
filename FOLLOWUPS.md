@@ -298,12 +298,18 @@ and I&M0-3 (`docs/design/2026-08-30-pnio-alarm-diag-im-design.md`):
 - **`gen_gsdml`'s `info_text` vs the in-crate golden `meta()`**: fixed in this same close-out
   (see the golden-catalogue identity fix below) — noted here because it was found while writing
   this plan's docs, not because anything remains open.
-- **Per-record Write status is not reported.** `cm::write::build_write_res`
+- **PARTIALLY RESOLVED (application records)** — **Per-record Write status is not reported.**
+  `cm::build_write_res_with` now carries a per-record status and the application record path
+  uses it; the I&M1-3 path (`handle_write_standard`) still answers OK with the status
+  hard-coded to `0`, as below. `cm::write::build_write_res`
   (`crates/pnio/src/cm/write.rs`) hard-codes each record's `status` field to `0`. A malformed I&M
   write is validated (`records::write_im_record` returns `write_invalid_parameter()`) and logged
   at `warn`, but the controller is told OK. Carry the per-record status into the response once
   the standard's exact per-record semantics are confirmed (see the IEC cross-check above).
-- **`read_record` ignores `api` and `record_data_length`.** `crates/pnio/src/cm/records.rs`
+- **PARTIALLY RESOLVED (application records)** — **`read_record` ignores `api` and
+  `record_data_length`.** Application read handlers are checked against `record_data_length`
+  (answered "invalid range" if the record does not fit) and against the controller's `args_max`;
+  `api` is still ignored everywhere, and the I&M path is unchanged (below). `crates/pnio/src/cm/records.rs`
   dispatches on `(slot, subslot, index)` only: a Read on a foreign API, or one whose
   `record_data_length` is smaller than the 60-byte I&M0 record, is answered as if it asked for
   API 0 with room to spare. The capture only ever shows API 0 and `0x8000` bytes.
@@ -377,3 +383,32 @@ and I&M0-3 (`docs/design/2026-08-30-pnio-alarm-diag-im-design.md`):
   DAP `0/1` and the four modules), so the "IM_Supported 0x000E everywhere" ruling is still only
   backed by the p-net capture.
 
+## Application records (`RDREC` / `WRREC`) and RPC fragmentation
+
+Open points recorded while implementing `cm::handlers` / `rpc::frag` (`docs/records.md`):
+
+- **Verify against a real controller.** Capture a fragmented `WRREC` and `RDREC` (a few KiB) from
+  the S7-1500 and pin them as goldens: the `fack` body (`rpc::frag::build_fack`), the flags on
+  the last fragment (`FRAG` alone vs `FRAG|LAST_FRAG`), whether the controller acknowledges every
+  response fragment (our window of 8 assumes it acknowledges at least some), `NO_FACK` semantics
+  on responses, and the 1392-byte fragment size.
+- **PNIORW codes in `RecordError`** (`0xA0..`, `0xB0..0xB9`) and "a failed single-record write is
+  the call's status" are from the standard/dissector, not from a capture; fold into the IEC
+  cross-check above.
+- **`MultipleRead`** (index `0xE041`) is not implemented.
+- **Records are capped at 64 KiB** (`MAX_RECORD_DATA`); larger transfers must be chunked by the
+  application. A streaming handler interface would avoid holding the whole record in memory.
+- **One fragmented request and one fragmented response at a time.** A second concurrent
+  fragmented call from the same controller replaces the first reassembly/transmit state.
+  Single AR makes this unlikely; revisit with multiple ARs or a controller that pipelines
+  `RDREC`s.
+- **No `working` PDU while a `Worker` handler runs.** A controller with a short RPC timeout
+  would retry (the retry is ignored); sending DCE-RPC `working` (ptype 4) keep-alives would let
+  long handlers coexist with it.
+- **The worker thread has no affinity/priority options**; it inherits the process defaults. Add a
+  `StartOptions` field if records and the real-time load must be kept apart.
+- **Worker results are collected on a 2 ms poll** (`RECORD_POLL_INTERVAL`) rather than woken by an
+  event fd; fine for acyclic traffic, but a wake-up would remove the latency floor.
+- **`ReadImplicit` of an application record is served without an AR** (as I&M reads are). If a
+  handler must only answer inside an AR, check `IoDevice::ar_state()` in it or return
+  `RecordError::StateConflict`.

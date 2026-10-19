@@ -9,7 +9,7 @@ const VERSION: u8 = 4;
 
 /// `flags1` bit: this is the last (or only) fragment.
 pub const FLAG1_LAST_FRAG: u8 = 0x02;
-/// `flags1` bit: this PDU is a fragment of a larger PDU (not supported by this crate).
+/// `flags1` bit: this PDU is a fragment of a larger PDU.
 pub const FLAG1_FRAG: u8 = 0x04;
 /// `flags1` bit: no `fack` (fragment acknowledgement) requested.
 pub const FLAG1_NO_FACK: u8 = 0x08;
@@ -139,7 +139,7 @@ pub struct RpcHeader {
     pub ahint: u16,
     /// Length of this fragment's body in bytes.
     pub frag_len: u16,
-    /// Fragment number; this crate requires `0` (no fragmentation support).
+    /// Fragment number: `0` for a single PDU and for the first fragment of a fragmented call.
     pub frag_num: u16,
     /// Authentication protocol identifier; `0` = none.
     pub auth_proto: u8,
@@ -151,11 +151,30 @@ impl RpcHeader {
     /// Fixed on-wire length of the DCE-RPC connectionless header, in bytes.
     pub const LEN: usize = 80;
 
-    /// Parses the 80-byte header. Errors: [`RpcError::TooShort`] if `buf` is shorter
-    /// than [`Self::LEN`]; [`RpcError::BadVersion`] if the version byte is not 4;
-    /// [`RpcError::UnsupportedPtype`] via [`PacketType::from_u8`]; [`RpcError::Fragmented`]
-    /// if `frag_num != 0` or [`FLAG1_FRAG`] is set.
+    /// Parses the 80-byte header and rejects fragments: [`RpcError::Fragmented`] if
+    /// `frag_num != 0` or [`FLAG1_FRAG`] is set. Use [`RpcHeader::parse_any`] where
+    /// fragments must be accepted.
     pub fn parse(buf: &[u8]) -> Result<RpcHeader, RpcError> {
+        let h = Self::parse_any(buf)?;
+        if h.is_fragment() {
+            return Err(RpcError::Fragmented {
+                frag_num: h.frag_num,
+                flags1: h.flags1,
+            });
+        }
+        Ok(h)
+    }
+
+    /// `true` if this PDU is one fragment of a multi-PDU call (`frag_num != 0` or
+    /// [`FLAG1_FRAG`] set). A single-PDU call has neither.
+    pub fn is_fragment(&self) -> bool {
+        self.frag_num != 0 || self.flags1 & FLAG1_FRAG != 0
+    }
+
+    /// Parses the 80-byte header, fragmented or not. Errors: [`RpcError::TooShort`] if
+    /// `buf` is shorter than [`Self::LEN`]; [`RpcError::BadVersion`] if the version
+    /// byte is not 4; [`RpcError::UnsupportedPtype`] via [`PacketType::from_u8`].
+    pub fn parse_any(buf: &[u8]) -> Result<RpcHeader, RpcError> {
         if buf.len() < Self::LEN {
             return Err(RpcError::TooShort {
                 need: Self::LEN,
@@ -183,10 +202,6 @@ impl RpcHeader {
         let frag_num = drep.u16(&buf[76..78]);
         let auth_proto = buf[78];
         let serial_lo = buf[79];
-
-        if frag_num != 0 || flags1 & FLAG1_FRAG != 0 {
-            return Err(RpcError::Fragmented { frag_num, flags1 });
-        }
 
         Ok(RpcHeader {
             ptype,
@@ -281,6 +296,21 @@ mod tests {
             h.write(&mut out);
             assert_eq!(out, &f[RPC_OFF..RPC_OFF + RpcHeader::LEN], "{name}");
         }
+    }
+
+    #[test]
+    fn parse_any_accepts_fragments_that_parse_rejects() {
+        let mut f = golden("connect_req")[RPC_OFF..].to_vec();
+        assert!(!RpcHeader::parse(&f).unwrap().is_fragment());
+        f[2] |= FLAG1_FRAG;
+        f[76] = 3; // frag_num (LE low byte)
+        let h = RpcHeader::parse_any(&f).unwrap();
+        assert!(h.is_fragment());
+        assert_eq!(h.frag_num, 3);
+        assert!(matches!(
+            RpcHeader::parse(&f),
+            Err(RpcError::Fragmented { frag_num: 3, .. })
+        ));
     }
 
     #[test]

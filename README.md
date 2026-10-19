@@ -39,6 +39,10 @@ hardware‑in‑the‑loop: a 12 h 51 soak at 500 µs with 0 missed cycles, tick
 - **Typed configuration → GSDML** (`config`, `gsdml`): declare slots and fields in Rust, render the
   GSDML V2.4 TIA imports from the same object — no drift between what the controller expects and
   what the device does.
+- **Application records — `RDREC` / `WRREC`** (`cm::handlers`, `rpc::frag`): register a closure
+  per record index and the controller's acyclic reads and writes of up to 64 KiB reach it,
+  carried over DCE-RPC fragmentation in both directions. Each handler runs inline on the
+  acyclic thread or, per handler, on a worker thread — see [`docs/records.md`](docs/records.md).
 - **A small facade** (`api::IoDevice`): typed `BOOL`/`INT`/`WORD`/`DINT`/`REAL` reads and writes,
   per‑cycle‑consistent slot snapshots, freshness/validity of the controller's data.
 
@@ -122,6 +126,7 @@ TIA import and XSD validation steps).
 | I&M0 read; I&M1‑3 read/write + file store | `im`, `cm::records` | ✅ I&M0 HIL; I&M1‑3 unit‑tested (see Limitations) |
 | Typed configuration, generated GSDML | `config`, `gsdml` | ✅ HIL — imported by TIA V21 |
 | Device facade, typed I/O | `api` | ✅ HIL |
+| Application records `RDREC`/`WRREC`, DCE-RPC fragmentation | `cm::handlers`, `rpc::frag` | ✅ unit/integration — **not yet HIL, no capture** (see [`docs/records.md`](docs/records.md)) |
 | pcap/pcapng replay harness (feature `capture`, default on) | `capture` | ✅ |
 
 Measured on the bench (Atom E3940, Debian 13 `PREEMPT_RT`, S7‑1515‑2 PN, TIA V21, X1 port at
@@ -137,6 +142,10 @@ application samples, controller‑side abort detected in 0.65 ms on device stop.
   `ModuleDiffBlock`, or diagnosis record reads (`0x800x`, `0xF8xx` — answered "invalid index").
 - **I&M1‑3 writes were never issued by TIA V21** to this device (GSDML `PNIO_Version="V2.3"`);
   the write path is unit‑tested only.
+- **Application records are unverified on a real controller**: the fragmentation and the
+  `RDREC`/`WRREC` statuses follow the standard and the Wireshark dissector, but no capture of a
+  fragmented exchange exists yet (`docs/records.md`, "What is verified"). Records are capped at
+  64 KiB; no `MultipleRead`.
 - **RT class 1 only**: no IRT, no MRP, no LLDP/PTP topology (the V2.31+ GSDML profile).
 - **Linux only**, single AR, development Vendor ID — **not PI‑certified**.
 

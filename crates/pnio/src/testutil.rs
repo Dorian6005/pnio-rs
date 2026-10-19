@@ -246,6 +246,88 @@ pub fn synthetic_connect_req(model: &crate::cm::DeviceModel) -> Vec<u8> {
     pdu
 }
 
+/// A complete DCE-RPC `Read` request PDU (header + NDR + one `IODReadReq`) for record
+/// `index` of `(slot, subslot)`, as call `seq` of activity `activity`, offering a
+/// `len`-byte buffer. Synthetic: there is no capture of an application record read.
+#[allow(dead_code)]
+pub fn record_read_pdu(
+    ar: crate::rpc::Uuid,
+    slot: u16,
+    subslot: u16,
+    index: u16,
+    len: u32,
+    seq: u32,
+    activity: u8,
+) -> Vec<u8> {
+    use crate::cm::{ty, BlockHeader};
+    use crate::rpc::{Drep, NdrRequest, RpcHeader, Uuid};
+    let mut h = RpcHeader::parse(&golden_alarm("im0_read_req")[RPC_OFF..]).unwrap();
+    h.opnum = 2;
+    h.seq_num = seq;
+    h.activity = Uuid([activity; 16]);
+    let mut b = Vec::new();
+    BlockHeader::write(&mut b, ty::IOD_READ_REQ_HEADER, 58);
+    b.extend_from_slice(&1u16.to_be_bytes());
+    ar.write(&mut b, Drep::BIG);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&slot.to_be_bytes());
+    b.extend_from_slice(&subslot.to_be_bytes());
+    b.extend_from_slice(&0u16.to_be_bytes());
+    b.extend_from_slice(&index.to_be_bytes());
+    b.extend_from_slice(&len.to_be_bytes());
+    b.extend_from_slice(&[0u8; 24]);
+    let mut d = Vec::new();
+    h.write(&mut d);
+    NdrRequest::for_blocks(65536, b.len() as u32).write(&mut d, h.drep);
+    d.extend_from_slice(&b);
+    d
+}
+
+/// The fragments of a complete DCE-RPC `Write` request PDU carrying one `IODWriteReq`
+/// record (`data` for `index` of `(slot, subslot)`), as call `seq` of activity
+/// `activity` — one PDU when it fits, several otherwise, exactly as a controller would
+/// send them.
+#[allow(dead_code)]
+pub fn record_write_pdus(
+    ar: crate::rpc::Uuid,
+    slot: u16,
+    subslot: u16,
+    index: u16,
+    data: &[u8],
+    seq: u32,
+    activity: u8,
+) -> Vec<Vec<u8>> {
+    use crate::cm::{ty, BlockHeader};
+    use crate::rpc::{frag, Drep, NdrRequest, RpcHeader, Uuid};
+    let mut h = RpcHeader::parse(&golden_alarm("im0_read_req")[RPC_OFF..]).unwrap();
+    h.opnum = 3;
+    h.seq_num = seq;
+    h.activity = Uuid([activity; 16]);
+    let mut b = Vec::new();
+    BlockHeader::write(&mut b, ty::IOD_WRITE_REQ_HEADER, 58);
+    b.extend_from_slice(&1u16.to_be_bytes());
+    ar.write(&mut b, Drep::BIG);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&slot.to_be_bytes());
+    b.extend_from_slice(&subslot.to_be_bytes());
+    b.extend_from_slice(&0u16.to_be_bytes());
+    b.extend_from_slice(&index.to_be_bytes());
+    b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    b.extend_from_slice(&[0u8; 24]);
+    b.extend_from_slice(data);
+    let mut stub = Vec::new();
+    NdrRequest::for_blocks(65536, b.len() as u32).write(&mut stub, h.drep);
+    stub.extend_from_slice(&b);
+    if stub.len() <= frag::FRAG_BODY_MAX {
+        let mut d = Vec::new();
+        h.write(&mut d);
+        d.extend_from_slice(&stub);
+        vec![d]
+    } else {
+        frag::fragment(&h, &stub)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

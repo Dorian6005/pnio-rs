@@ -5,7 +5,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use thiserror::Error;
@@ -14,7 +14,9 @@ use crate::alarm::{
     AlarmAction, AlarmChannel, AlarmChannelConfig, AlarmNotification, AlarmReq, Priority,
 };
 use crate::cm::model::DeviceModel;
-use crate::cm::{AbortReason, ArParams, ArState, Cm, CmOutput, PnioStatus};
+use crate::cm::{
+    AbortReason, ArParams, ArState, Cm, CmOutput, JobDone, PnioStatus, RecordJob, RecordRegistry,
+};
 use crate::config::Slot;
 use crate::dcp::{handle_dcp_frame, DcpConfig};
 use crate::diag::{ChannelError, DiagStore, Diagnosis};
@@ -25,6 +27,36 @@ use crate::rpc::{RpcError, RpcTransport, Uuid};
 use crate::rt::{IoImage, RtStats};
 #[cfg(target_os = "linux")]
 use crate::rt::{Layout, RtConfig, RtError, RtEvent, RtHandle, RtRunner, WatchdogState};
+
+/// How often the loop wakes while a record request waits for the worker thread, so the
+/// response leaves within a couple of milliseconds of the handler returning.
+const RECORD_POLL_INTERVAL: Duration = Duration::from_millis(2);
+
+/// The thread that runs record handlers registered with
+/// [`RecordExec::Worker`](crate::cm::RecordExec::Worker): jobs go in, results come back
+/// and are turned into responses by the acyclic loop. Spawned on first use; dropping it
+/// closes the job channel, which ends the thread.
+struct RecordWorker {
+    jobs: mpsc::Sender<RecordJob>,
+    done: mpsc::Receiver<JobDone>,
+}
+
+impl RecordWorker {
+    fn spawn() -> std::io::Result<RecordWorker> {
+        let (jobs, job_rx) = mpsc::channel::<RecordJob>();
+        let (done_tx, done) = mpsc::channel::<JobDone>();
+        std::thread::Builder::new()
+            .name("pnio-records".into())
+            .spawn(move || {
+                for job in job_rx {
+                    if done_tx.send(job.run()).is_err() {
+                        break;
+                    }
+                }
+            })?;
+        Ok(RecordWorker { jobs, done })
+    }
+}
 
 /// Callback invoked once per AR state-change notification.
 type StateChangeCallback = Box<dyn FnMut(ArState, Option<AbortReason>) + Send>;
@@ -217,6 +249,8 @@ pub struct Device<E: EthTransport, R: RpcTransport> {
     /// otherwise a stale abort (e.g. the controller's ERR-RTA) drained in the same
     /// `step` as its reconnect would tear down the AR that reconnect just built.
     alarm_epoch: u64,
+    /// Worker for `RecordExec::Worker` handlers; spawned on the first such request.
+    worker: Option<RecordWorker>,
     /// The currently running RT thread, if any (Linux-only: the runner itself is
     /// only ever built on Linux).
     #[cfg(target_os = "linux")]
@@ -249,6 +283,7 @@ impl<E: EthTransport, R: RpcTransport> Device<E, R> {
             alarm: None,
             next_alarm_id: 0,
             alarm_epoch: 0,
+            worker: None,
             #[cfg(target_os = "linux")]
             runner: None,
             #[cfg(target_os = "linux")]
@@ -317,9 +352,52 @@ impl<E: EthTransport, R: RpcTransport> Device<E, R> {
             .is_empty();
         if self.alarm_in_flight() || queued {
             ALARM_POLL_INTERVAL.min(default)
+        } else if self.cm.pending_jobs() > 0 {
+            RECORD_POLL_INTERVAL.min(default)
         } else {
             default
         }
+    }
+
+    /// The table of application record handlers (`RDREC`/`WRREC` indices). Clones share
+    /// the table, so handlers can be added or removed while the device runs.
+    pub fn records(&self) -> RecordRegistry {
+        self.cm.registry()
+    }
+
+    /// Hands the record jobs the `Cm` queued to the worker thread and turns the
+    /// results that came back into responses. If the worker thread cannot be started the
+    /// job runs inline instead, so a request is never left unanswered.
+    fn pump_records(&mut self, now: Instant, report: &mut StepReport) -> Result<(), DeviceError> {
+        let mut finished: Vec<JobDone> = Vec::new();
+        for job in self.cm.take_jobs() {
+            if self.worker.is_none() {
+                match RecordWorker::spawn() {
+                    Ok(w) => self.worker = Some(w),
+                    Err(e) => log::error!("cannot start the record worker ({e}); running inline"),
+                }
+            }
+            match &self.worker {
+                Some(w) => {
+                    if let Err(mpsc::SendError(job)) = w.jobs.send(job) {
+                        log::error!("record worker is gone; running the job inline");
+                        self.worker = None;
+                        finished.push(job.run());
+                    }
+                }
+                None => finished.push(job.run()),
+            }
+        }
+        if let Some(w) = &self.worker {
+            while let Ok(done) = w.done.try_recv() {
+                finished.push(done);
+            }
+        }
+        for done in finished {
+            let out = self.cm.complete_job(done, now);
+            self.dispatch(out, now, report)?;
+        }
+        Ok(())
     }
 
     /// A clone of the current AR's negotiated parameters, if one is established.
@@ -466,6 +544,9 @@ impl<E: EthTransport, R: RpcTransport> Device<E, R> {
                 Err(e) => log::warn!("dropping unparsable RPC datagram: {e}"),
             }
         }
+
+        // (3b) Record handlers that run on the worker thread.
+        self.pump_records(now, &mut report)?;
 
         // (4) RT thread events.
         #[cfg(target_os = "linux")]
@@ -969,6 +1050,126 @@ mod tests {
     fn reconnect(dev: &mut Device<SharedEth, MockRpcTransport>) {
         feed_bring_up(dev, Some(0x100), None);
         dev.step(Instant::now(), Some(Duration::ZERO)).unwrap();
+    }
+
+    /// The `ar_uuid` of the AR that `feed_bring_up` establishes (the `cm` golden's).
+    fn bench_ar() -> Uuid {
+        Uuid::parse_str("e5e1aecc-b133-4b4d-b187-cc68b0211ed2").unwrap()
+    }
+
+    /// Joins the stubs of response PDUs (fragmented or not) and parses the NDR header.
+    fn response_blocks(pdus: &[Vec<u8>]) -> (PnioStatus, Vec<u8>) {
+        let mut stub = Vec::new();
+        for p in pdus {
+            stub.extend_from_slice(&p[crate::rpc::RpcHeader::LEN..]);
+        }
+        let (n, blocks) = crate::rpc::NdrResponse::parse(&stub, crate::rpc::Drep::BIG).unwrap();
+        (PnioStatus(n.status), blocks.to_vec())
+    }
+
+    /// Steps until `done` holds or `limit` passes.
+    fn step_until(
+        dev: &mut Device<SharedEth, MockRpcTransport>,
+        limit: Duration,
+        mut done: impl FnMut(&Device<SharedEth, MockRpcTransport>) -> bool,
+    ) -> bool {
+        let start = Instant::now();
+        while start.elapsed() < limit {
+            let wait = dev.poll_interval(Duration::from_millis(1));
+            dev.step(Instant::now(), Some(wait)).unwrap();
+            if done(dev) {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        false
+    }
+
+    #[test]
+    fn worker_handler_runs_off_the_loop_and_the_response_is_sent_when_it_returns() {
+        let (mut dev, _eth) = device_in_data();
+        let cpu = "172.16.2.100:54766".parse().unwrap();
+        let data: Vec<u8> = (0..3000u32).map(|i| (i % 251) as u8).collect();
+        let d2 = data.clone();
+        let handler_thread = Arc::new(Mutex::new(None));
+        let ht = handler_thread.clone();
+        dev.records()
+            .on_read(0x70, crate::cm::RecordExec::Worker, move |_| {
+                *ht.lock().unwrap() = Some(std::thread::current().name().map(str::to_owned));
+                std::thread::sleep(Duration::from_millis(40));
+                Ok(d2.clone())
+            })
+            .unwrap();
+        let before = dev.rpc().sent().len();
+        dev.rpc().push_rx(
+            crate::testutil::record_read_pdu(bench_ar(), 0, 1, 0x70, 65536, 5000, 3),
+            cpu,
+        );
+        let t0 = Instant::now();
+        dev.step(Instant::now(), Some(Duration::ZERO)).unwrap();
+        // the loop is free: nothing sent yet, a job is outstanding, and the next poll is short
+        assert_eq!(dev.rpc().sent().len(), before);
+        assert_eq!(dev.cm.pending_jobs(), 1);
+        assert!(dev.poll_interval(Duration::from_millis(200)) <= RECORD_POLL_INTERVAL);
+        // a DCP-style tick in between does not block on the handler
+        assert!(t0.elapsed() < Duration::from_millis(30));
+
+        assert!(step_until(&mut dev, Duration::from_secs(2), |d| d
+            .rpc()
+            .sent()
+            .len()
+            > before));
+        let pdus: Vec<Vec<u8>> = dev.rpc().sent()[before..]
+            .iter()
+            .map(|(b, _)| b.clone())
+            .collect();
+        let (status, blocks) = response_blocks(&pdus);
+        assert!(status.is_ok());
+        assert_eq!(&blocks[64..], &data[..]);
+        assert_eq!(dev.cm.pending_jobs(), 0);
+        let name = handler_thread.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            name.as_deref(),
+            Some("pnio-records"),
+            "ran on the worker thread"
+        );
+        assert_eq!(
+            dev.poll_interval(Duration::from_millis(200)),
+            Duration::from_millis(200)
+        );
+    }
+
+    #[test]
+    fn inline_handler_answers_within_the_same_step() {
+        let (mut dev, _eth) = device_in_data();
+        let cpu = "172.16.2.100:54766".parse().unwrap();
+        let received = Arc::new(Mutex::new(Vec::new()));
+        let r2 = received.clone();
+        dev.records()
+            .on_write(0x71, crate::cm::RecordExec::Inline, move |_, d| {
+                *r2.lock().unwrap() = d.to_vec();
+                Ok(())
+            })
+            .unwrap();
+        let data: Vec<u8> = (0..9000u32).map(|i| (i % 253) as u8).collect();
+        let before = dev.rpc().sent().len();
+        let frags = crate::testutil::record_write_pdus(bench_ar(), 0, 1, 0x71, &data, 6000, 4);
+        assert!(frags.len() > 6, "a 9000 byte record needs many fragments");
+        for f in frags {
+            dev.rpc().push_rx(f, cpu);
+        }
+        dev.step(Instant::now(), Some(Duration::ZERO)).unwrap();
+        assert_eq!(*received.lock().unwrap(), data);
+        let sent = dev.rpc().sent();
+        let last = &sent.last().unwrap().0;
+        let (status, _) = response_blocks(std::slice::from_ref(last));
+        assert!(status.is_ok());
+        // every fragment but the last was acknowledged
+        let facks = sent[before..]
+            .iter()
+            .filter(|(b, _)| b[1] == crate::rpc::PacketType::Fack as u8)
+            .count();
+        assert_eq!(facks, sent.len() - before - 1);
     }
 
     fn line_break() -> Diagnosis {
