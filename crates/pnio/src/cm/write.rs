@@ -6,7 +6,7 @@
 //! to the next 4-byte boundary. The response mirrors the request one-for-one, in
 //! request order, each response record a fixed 64 bytes with `status = 0`.
 
-use super::{ty, BlockError, BlockHeader, CmError, Cursor};
+use super::{ty, BlockError, BlockHeader, CmError, Cursor, PnioStatus};
 use crate::rpc::{Drep, Uuid};
 
 /// The index of the `MultipleWrite` container record (IEC 61158-6-10 §4.8.5.3).
@@ -117,8 +117,14 @@ fn parse_one(buf: &[u8]) -> Result<(Record, usize), BlockError> {
 /// in request order, each 64 bytes (`record_data_length = 0`, `additional_value_1/2 = 0`,
 /// `status = 0`).
 pub fn build_write_res(req: &WriteReq) -> Vec<u8> {
+    build_write_res_with(req, &[])
+}
+
+/// Like [`build_write_res`], but record `i` carries `statuses[i]` in its `status` field
+/// (a record past the end of `statuses` carries `0`, success).
+pub fn build_write_res_with(req: &WriteReq, statuses: &[PnioStatus]) -> Vec<u8> {
     let mut out = Vec::with_capacity(req.records.len() * 64);
-    for r in &req.records {
+    for (i, r) in req.records.iter().enumerate() {
         BlockHeader::write(&mut out, ty::IOD_WRITE_RES_HEADER, 58);
         out.extend_from_slice(&r.seq.to_be_bytes());
         r.ar_uuid.write(&mut out, Drep::BIG);
@@ -130,7 +136,8 @@ pub fn build_write_res(req: &WriteReq) -> Vec<u8> {
         out.extend_from_slice(&0u32.to_be_bytes()); // record_data_length
         out.extend_from_slice(&0u16.to_be_bytes()); // additional_value_1
         out.extend_from_slice(&0u16.to_be_bytes()); // additional_value_2
-        out.extend_from_slice(&0u32.to_be_bytes()); // status
+        let status = statuses.get(i).map_or(0, |s| s.to_u32());
+        out.extend_from_slice(&status.to_be_bytes()); // status
         out.extend_from_slice(&[0u8; 16]); // padding
     }
     out
@@ -175,6 +182,21 @@ mod tests {
         let out = build_write_res(&w);
         assert_eq!(out, &golden("write_res")[BLOCKS..]);
         assert_eq!(out.len(), 320);
+    }
+
+    #[test]
+    fn per_record_status_is_written_into_the_response() {
+        let w = WriteReq::parse(&golden("write_req")[BLOCKS..]).unwrap();
+        let bad = PnioStatus::new(0xdf, 0x80, 0xb1, 0);
+        let out = build_write_res_with(&w, &[PnioStatus::OK, PnioStatus::OK, bad]);
+        // status sits at offset 6 (header) + 2 + 16 + 4 + 2 + 2 + 2 + 2 + 4 + 2 + 2 = 44
+        assert_eq!(&out[2 * 64 + 44..2 * 64 + 48], &bad.to_u32().to_be_bytes());
+        assert_eq!(&out[44..48], &[0; 4]);
+        // everything but the status word equals the all-OK response
+        let ok = build_write_res(&w);
+        let mut patched = out.clone();
+        patched[2 * 64 + 44..2 * 64 + 48].copy_from_slice(&[0; 4]);
+        assert_eq!(patched, ok);
     }
 
     #[test]

@@ -6,6 +6,36 @@ follows SemVer's 0.y.z rules (breaking changes bump the minor version).
 
 ## [Unreleased]
 
+### Added
+- **Application records (`RDREC` / `WRREC`).** `IoDevice::on_read_record` /
+  `on_write_record` / `remove_record_handler` (and the underlying `cm::RecordRegistry`) serve
+  the controller's acyclic record reads and writes of manufacturer-specific indices
+  `0x0000..=0x7FFF` with application closures, up to 64 KiB per record. Each handler is
+  registered with a `RecordExec`: `Inline` (acyclic thread) or `Worker` (a dedicated
+  `pnio-records` thread, parked requests answered when the closure returns). Errors map to
+  PNIORW statuses through `RecordError`; panics become `ModuleFailure`.
+- **DCE-RPC connectionless fragmentation** (`rpc::frag`), both directions: fragmented requests
+  are reassembled and acknowledged with `fack`; responses larger than 1392 bytes are fragmented,
+  windowed (8) and paced by the controller's `fack`s, with a stall retransmit. Out-of-order and
+  duplicate fragments, size and time limits.
+- Per-record Write status in the response (`cm::build_write_res_with`), used for application
+  records.
+- `docs/records.md`.
+
+### Changed
+- `rpc::RpcHeader::parse` still rejects fragments; `RpcHeader::parse_any` and
+  `RpcHeader::is_fragment` accept and detect them. `Cm::handle_datagram` now handles fragmented
+  requests instead of dropping them.
+- Writes handled by an application handler are **not** stored in the AR's parameter-record store,
+  so they do not count against its 64-record / 64 KiB cap.
+- `Device::poll_interval` is 2 ms while a record request waits for the worker.
+
+### Known limitations
+- No capture of an application `RDREC`/`WRREC` or of a fragmented exchange from a real
+  controller exists: `fack` layout, fragment flags, PNIORW codes and the 1392-byte fragment size
+  are unverified on hardware. See `docs/records.md`.
+- No `MultipleRead`; records are capped at 64 KiB.
+
 ## [0.1.0] — 2026-08-31
 
 First published version (crates.io `pnio 0.1.0`, tag `v0.1.0`). A PROFINET RT IO-Device (Conformance Class A, RT class 1) in pure

@@ -1,5 +1,6 @@
 //! DCE-RPC v4 connectionless (CL) codec used by PROFINET IO (UDP port 34964).
 
+pub mod frag;
 pub mod header;
 pub mod ndr;
 pub mod transport;

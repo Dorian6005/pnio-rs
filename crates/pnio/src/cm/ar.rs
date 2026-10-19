@@ -319,6 +319,26 @@ impl Ar {
         }
     }
 
+    /// Access check for a Write whose records the *application* handles instead of the
+    /// AR storing them: the same gate as a stored write (an AR must exist, every record
+    /// must carry its `ar_uuid`) but without accumulating anything, so the per-AR
+    /// record cap is never consumed by runtime traffic. Re-arms the activity timer while
+    /// still `Connected`, like a stored write.
+    pub fn write_access(&mut self, records: &[Record], now: Instant) -> Result<(), PnioStatus> {
+        if self.state == ArState::Idle {
+            return Err(PnioStatus::control_wrong_state());
+        }
+        let ctx = self.ctx.as_ref().expect("ctx present outside Idle");
+        if records.iter().any(|r| r.ar_uuid != ctx.params.ar_uuid) {
+            return Err(PnioStatus::write_wrong_ar());
+        }
+        if self.state == ArState::Connected {
+            let factor = ctx.params.activity_timeout_factor;
+            self.activity_deadline = Some(now + ACTIVITY_TIMEOUT_UNIT * factor as u32);
+        }
+        Ok(())
+    }
+
     fn handle_write(&mut self, req: WriteReq, now: Instant) -> Vec<Action> {
         match self.state {
             ArState::Idle => vec![wrong_state()],

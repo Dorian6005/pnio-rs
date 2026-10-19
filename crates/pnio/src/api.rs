@@ -3,7 +3,8 @@
 //! by (slot, index) with the config's field table. The RT path is untouched.
 
 use crate::alarm::AlarmStats;
-use crate::cm::{AbortReason, ArParams, ArState};
+use crate::cm::{AbortReason, ArParams, ArState, RecordRegistry};
+pub use crate::cm::{RecordError, RecordExec, RecordRequest, RegisterError, USER_INDEX_MAX};
 use crate::config::{DeviceConfig, Direction, FieldRef, Slot};
 use crate::data::{CodecError, FieldType, Value};
 use crate::device::{Device, DeviceError, DiagCommand, DiagShared, RtOptions};
@@ -190,6 +191,8 @@ pub struct IoDevice {
     /// `Device`, so it stays readable/writable from the application thread for the
     /// `IoDevice`'s whole lifetime.
     diag: Arc<DiagShared>,
+    /// Application record handlers (`RDREC`/`WRREC`), shared with the acyclic thread.
+    records: RecordRegistry,
 }
 
 impl IoDevice {
@@ -267,6 +270,7 @@ impl IoDevice {
         let image = dev.image();
         let stats = dev.rt_stats();
         let diag = dev.diag_shared();
+        let records = dev.records();
         let stop = Arc::new(AtomicBool::new(false));
         let inputs = cfg
             .submodules()
@@ -300,7 +304,49 @@ impl IoDevice {
             thread: Mutex::new(Some(thread)),
             params,
             diag,
+            records,
         })
+    }
+
+    /// Serves the controller's **record reads** (`RDREC`) of manufacturer-specific
+    /// `index` (`0x0000..=`[`USER_INDEX_MAX`]) with `f`, on every slot/subslot of the
+    /// device. `f` returns the record's bytes — up to 64 KiB, fragmented over as many
+    /// RPC datagrams as needed — or a [`RecordError`] that is reported to the controller
+    /// as the matching PROFINET error. Registering again replaces the handler.
+    ///
+    /// `exec` chooses where `f` runs: [`RecordExec::Inline`] on the acyclic thread (lowest
+    /// latency; `f` must be short and must not block, because DCP, alarms and RPC
+    /// retransmissions are served by the same thread) or [`RecordExec::Worker`] on a
+    /// dedicated worker thread (`f` may block or compute; the request is answered when it
+    /// returns). The cyclic real-time thread is never involved.
+    ///
+    /// Errors: [`RegisterError::ReservedIndex`] for an index above [`USER_INDEX_MAX`].
+    pub fn on_read_record(
+        &self,
+        index: u16,
+        exec: RecordExec,
+        f: impl Fn(&RecordRequest) -> Result<Vec<u8>, RecordError> + Send + Sync + 'static,
+    ) -> Result<(), RegisterError> {
+        self.records.on_read(index, exec, f)
+    }
+
+    /// Serves the controller's **record writes** (`WRREC`) to manufacturer-specific
+    /// `index` with `f`, which receives the (reassembled) record bytes. Same index range,
+    /// size limit and `exec` semantics as [`IoDevice::on_read_record`]. A write handled
+    /// here is never accumulated by the AR, so it can be repeated indefinitely.
+    pub fn on_write_record(
+        &self,
+        index: u16,
+        exec: RecordExec,
+        f: impl Fn(&RecordRequest, &[u8]) -> Result<(), RecordError> + Send + Sync + 'static,
+    ) -> Result<(), RegisterError> {
+        self.records.on_write(index, exec, f)
+    }
+
+    /// Removes the read and write handlers of `index`; the controller gets "invalid
+    /// index" for it again.
+    pub fn remove_record_handler(&self, index: u16) {
+        self.records.remove(index);
     }
 
     /// The [`DeviceConfig`] this device was started with.
